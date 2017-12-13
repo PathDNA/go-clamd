@@ -27,13 +27,13 @@ package clamd
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -44,72 +44,61 @@ var resultRegex = regexp.MustCompile(
 	`^(?P<path>[^:]+): ((?P<desc>[^:]+)(\((?P<virhash>([^:]+)):(?P<virsize>\d+)\))? )?(?P<status>FOUND|ERROR|OK)$`,
 )
 
-type CLAMDConn struct {
+type Conn struct {
 	net.Conn
 }
 
-func (conn *CLAMDConn) sendCommand(command string) error {
+func (conn *Conn) sendCommand(command string) error {
 	commandBytes := []byte(fmt.Sprintf("n%s\n", command))
 
 	_, err := conn.Write(commandBytes)
 	return err
 }
 
-func (conn *CLAMDConn) sendEOF() error {
+func (conn *Conn) sendEOF() error {
 	_, err := conn.Write([]byte{0, 0, 0, 0})
 	return err
 }
 
-func (conn *CLAMDConn) sendChunk(data []byte) error {
-	var buf [4]byte
-	lenData := len(data)
-	buf[0] = byte(lenData >> 24)
-	buf[1] = byte(lenData >> 16)
-	buf[2] = byte(lenData >> 8)
-	buf[3] = byte(lenData >> 0)
+var putUint32 = binary.BigEndian.PutUint32
 
-	a := buf
+func (conn *Conn) sendChunk(data []byte) error {
+	var blen [4]byte
+	putUint32(blen[:], uint32(len(data)))
 
-	b := make([]byte, len(a))
-	for i := range a {
-		b[i] = a[i]
-	}
-
-	conn.Write(b)
-
+	_, _ = conn.Write(blen[:])
 	_, err := conn.Write(data)
 	return err
 }
 
-func (c *CLAMDConn) readResponse() (chan *ScanResult, *sync.WaitGroup, error) {
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	reader := bufio.NewReader(c)
-	ch := make(chan *ScanResult)
-
+func (c *Conn) readResponse() (<-chan *ScanResult, <-chan error) {
+	var (
+		reader = bufio.NewReader(c)
+		ch     = make(chan *ScanResult)
+		errCh  = make(chan error, 1)
+	)
 	go func() {
+		var err error
 		defer func() {
 			close(ch)
-			wg.Done()
+			errCh <- err
+			close(errCh)
 		}()
 
 		for {
-			line, err := reader.ReadString('\n')
-			if err == io.EOF {
+			var line string
+			if line, err = reader.ReadString('\n'); err != nil {
+				if err == io.EOF {
+					err = nil
+				}
 				return
 			}
-
-			if err != nil {
-				return
-			}
-
 			line = strings.TrimRight(line, " \t\r\n")
 			ch <- parseResult(line)
 		}
 	}()
 
-	return ch, &wg, nil
+	return ch, errCh
 }
 
 func parseResult(line string) *ScanResult {
@@ -154,7 +143,7 @@ func parseResult(line string) *ScanResult {
 	return res
 }
 
-func newCLAMDTcpConn(address string) (*CLAMDConn, error) {
+func newCLAMDTcpConn(address string) (*Conn, error) {
 	conn, err := net.DialTimeout("tcp", address, TCP_TIMEOUT)
 
 	if err != nil {
@@ -165,14 +154,14 @@ func newCLAMDTcpConn(address string) (*CLAMDConn, error) {
 		return nil, err
 	}
 
-	return &CLAMDConn{Conn: conn}, err
+	return &Conn{Conn: conn}, err
 }
 
-func newCLAMDUnixConn(address string) (*CLAMDConn, error) {
+func newCLAMDUnixConn(address string) (*Conn, error) {
 	conn, err := net.Dial("unix", address)
 	if err != nil {
 		return nil, err
 	}
 
-	return &CLAMDConn{Conn: conn}, err
+	return &Conn{Conn: conn}, err
 }

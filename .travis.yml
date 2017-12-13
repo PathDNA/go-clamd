@@ -1,9 +1,7 @@
 language: go
-go: 
- - 1.1
- - 1.2
- - 1.3
- - release
+go:
+ - 1.8
+ - stable
  - tip
 
 script:
