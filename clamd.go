@@ -26,9 +26,9 @@ SOFTWARE.
 package clamd
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"log"
 	"net/url"
 	"strings"
 )
@@ -42,6 +42,8 @@ const (
 
 type Clamd struct {
 	address string
+
+	newConnection func() (*Conn, error)
 }
 
 type Stats struct {
@@ -59,28 +61,6 @@ type ScanResult struct {
 	Hash        string
 	Size        int
 	Status      string
-}
-
-var EICAR = []byte(`X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*`)
-
-func (c *Clamd) newConnection() (conn *Conn, err error) {
-
-	var u *url.URL
-
-	if u, err = url.Parse(c.address); err != nil {
-		return
-	}
-
-	switch u.Scheme {
-	case "tcp":
-		conn, err = newCLAMDTcpConn(u.Host)
-	case "unix":
-		conn, err = newCLAMDUnixConn(u.Path)
-	default:
-		conn, err = newCLAMDUnixConn(c.address)
-	}
-
-	return
 }
 
 func (c *Clamd) simpleCommand(command string) (<-chan *ScanResult, error) {
@@ -124,9 +104,13 @@ func (c *Clamd) Ping() error {
 /*
 Print program and database versions.
 */
-func (c *Clamd) Version() (<-chan *ScanResult, error) {
-	dataArrays, err := c.simpleCommand("VERSION")
-	return dataArrays, err
+func (c *Clamd) Version() (string, error) {
+	ch, err := c.simpleCommand("VERSION")
+	if err != nil {
+		return "", err
+	}
+	s := <-ch
+	return s.Raw, nil
 }
 
 /*
@@ -155,7 +139,6 @@ func (c *Clamd) Stats() (*Stats, error) {
 			stats.Memstats = s.Raw[10:]
 		} else if s.Raw == "" || strings.HasPrefix(s.Raw, "END") || strings.HasPrefix(s.Raw, "\tSTATS") {
 		} else {
-			log.Printf("%#+v", s)
 			return nil, fmt.Errorf("invalid response, got %#+v.", s)
 		}
 	}
@@ -245,7 +228,7 @@ the actual chunk. Streaming is terminated by sending a zero-length chunk. Note:
 do not exceed StreamMaxLength as defined in clamd.conf, otherwise clamd will
 reply with INSTREAM size limit exceeded and close the connection
 */
-func (c *Clamd) ScanStream(r io.Reader, abort chan bool) (<-chan *ScanResult, error) {
+func (c *Clamd) ScanStream(ctx context.Context, r io.Reader) (<-chan *ScanResult, error) {
 	conn, err := c.newConnection()
 	if err != nil {
 		return nil, err
@@ -257,10 +240,12 @@ func (c *Clamd) ScanStream(r io.Reader, abort chan bool) (<-chan *ScanResult, er
 		buf := make([]byte, CHUNK_SIZE)
 
 		n, err := r.Read(buf)
-		if err != nil || n == 0 {
-			break
+		if n > 0 {
+			if err = conn.sendChunk(buf[:n]); err != nil {
+				break
+			}
 		}
-		if err = conn.sendChunk(buf[0:n]); err != nil {
+		if err != nil {
 			break
 		}
 
@@ -276,7 +261,7 @@ func (c *Clamd) ScanStream(r io.Reader, abort chan bool) (<-chan *ScanResult, er
 	go func() {
 		select {
 		case <-errCh:
-		case <-abort:
+		case <-ctx.Done():
 		}
 		conn.Close()
 	}()
@@ -284,7 +269,25 @@ func (c *Clamd) ScanStream(r io.Reader, abort chan bool) (<-chan *ScanResult, er
 	return ch, err
 }
 
-func NewClamd(address string) *Clamd {
-	clamd := &Clamd{address: address}
-	return clamd
+func NewClamd(addr string) (*Clamd, error) {
+	if strings.HasPrefix(addr, "/") {
+		addr = "unix:" + addr
+	}
+	u, err := url.Parse(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	clamd := &Clamd{address: addr}
+
+	switch u.Scheme {
+	case "tcp":
+		clamd.newConnection = func() (*Conn, error) { return newCLAMDTcpConn(u.Host) }
+	case "unix":
+		clamd.newConnection = func() (*Conn, error) { return newCLAMDUnixConn(u.Path) }
+	default:
+		clamd.newConnection = func() (*Conn, error) { return newCLAMDUnixConn(addr) }
+	}
+
+	return clamd, nil
 }
